@@ -1,0 +1,15 @@
+/*
+Theme Name: Hello Artist
+Description: Child theme of Hello Elementor for eCommerce art gallery. Component-based architecture without page builders.
+Author: PreciseFuture
+Version: 0.1.0
+Template: hello-elementor
+Requires at least: 6.0
+Tested up to: 6.4
+Requires PHP: 8.2
+License: GPL v2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
+Text Domain: hello-artist
+*/
+
+/* This file intentionally left mostly empty - styles are managed through component-based architecture */
