@@ -6,6 +6,10 @@ on:
   release:
     types: [ published ]
 
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
 jobs:
   deploy-production:
     name: Deploy to Production Environment
@@ -16,186 +20,95 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup PHP
-      uses: shivammathur/setup-php@v2
-      with:
-        php-version: '8.2'
-        extensions: mbstring, xml, ctype, iconv, intl, pdo_mysql, dom, filter, gd, json
+    - name: Load URLs
+      run: |
+        set -a
+        source .github/urls.env
+        echo "STAGING_URL=$STAGING_URL" >> $GITHUB_ENV
+        echo "PRODUCTION_URL=$PRODUCTION_URL" >> $GITHUB_ENV
 
-    - name: Setup Node.js
+    - name: Setup Node
       uses: actions/setup-node@v4
       with:
-        node-version: '20'
+        node-version: 20
         cache: 'npm'
+        cache-dependency-path: |
+          package-lock.json
+          ../pf-artist-core/package-lock.json
 
-    - name: Install dependencies and build
+    - name: Build theme assets
       run: |
-        if [ -f "composer.json" ]; then
-          composer install --no-dev --optimize-autoloader --classmap-authoritative
-        fi
-        
         if [ -f "package.json" ]; then
           npm ci
           NODE_ENV=production npm run build || npm run prod || echo "No build script available"
         fi
 
-    - name: Prepare production package
-      run: |
-        # Create deployment directory
-        mkdir -p deploy
-        
-        # Copy only production files
-        rsync -av --exclude='.git' \
-                  --exclude='node_modules' \
-                  --exclude='vendor' \
-                  --exclude='.github' \
-                  --exclude='*.md' \
-                  --exclude='package*.json' \
-                  --exclude='composer.*' \
-                  --exclude='.*' \
-                  --exclude='ci-cd.md' \
-                  --exclude='contexto.md' \
-                  --exclude='diseno-grafico.md' \
-                  ./ deploy/
-        
-        # Create release info
-        echo "${{ github.sha }}" > deploy/VERSION
-        echo "$(date -u)" > deploy/DEPLOYED_AT
-        echo "${{ github.ref_name }}" > deploy/RELEASE_TAG
+    # - name: Build plugin assets
+    #   working-directory: ../pf-artist-core
+    #   run: |
+    #     npm ci
+    #     npm run build
 
-    - name: Create backup
-      uses: appleboy/ssh-action@v1.0.0
+    - name: Sync theme
+      uses: burnett01/rsync-deployments@6.0
+      with:
+        switches: -az --delete
+        path: ./
+        remote_path: ${{ secrets.PRODUCTION_WP_PATH }}/wp-content/themes/hello-artist/
+        remote_host: ${{ secrets.PRODUCTION_HOST }}
+        remote_user: ${{ secrets.PRODUCTION_USER }}
+        remote_port: ${{ secrets.PRODUCTION_PORT }}
+        remote_key: ${{ secrets.PRODUCTION_SSH_KEY }}
+
+    - name: Sync plugin (pf-artist-core)
+      uses: burnett01/rsync-deployments@6.0
+      with:
+        switches: -az --delete
+        path: ../pf-artist-core/
+        remote_path: ${{ secrets.PRODUCTION_WP_PATH }}/wp-content/plugins/pf-artist-core/
+        remote_host: ${{ secrets.PRODUCTION_HOST }}
+        remote_user: ${{ secrets.PRODUCTION_USER }}
+        remote_port: ${{ secrets.PRODUCTION_PORT }}
+        remote_key: ${{ secrets.PRODUCTION_SSH_KEY }}
+
+    - name: Post-deploy tasks
+      uses: appleboy/ssh-action@v1
       with:
         host: ${{ secrets.PRODUCTION_HOST }}
         username: ${{ secrets.PRODUCTION_USER }}
         key: ${{ secrets.PRODUCTION_SSH_KEY }}
-        port: ${{ secrets.PRODUCTION_PORT || 22 }}
-        script: |
-          # Set environment variables
-          export WP_ENV=production
-          
-          # Navigate to WordPress root
-          cd ${{ secrets.PRODUCTION_WP_PATH }}
-          
-          # Create backup directory with timestamp
-          BACKUP_DIR="backups/hello-artist-$(date +%Y%m%d-%H%M%S)"
-          mkdir -p "$BACKUP_DIR"
-          
-          # Backup current theme
-          if [ -d "wp-content/themes/hello-artist" ]; then
-            cp -r wp-content/themes/hello-artist "$BACKUP_DIR/"
-            echo "Theme backup created: $BACKUP_DIR"
-          fi
-          
-          # Backup database
-          if command -v wp &> /dev/null; then
-            wp db export "$BACKUP_DIR/database-$(date +%Y%m%d-%H%M%S).sql"
-            echo "Database backup created"
-          fi
-          
-          # Keep only last 5 backups
-          ls -t backups/ | tail -n +6 | xargs -r rm -rf
-
-    - name: Enable maintenance mode
-      uses: appleboy/ssh-action@v1.0.0
-      with:
-        host: ${{ secrets.PRODUCTION_HOST }}
-        username: ${{ secrets.PRODUCTION_USER }}
-        key: ${{ secrets.PRODUCTION_SSH_KEY }}
-        port: ${{ secrets.PRODUCTION_PORT || 22 }}
+        port: ${{ secrets.PRODUCTION_PORT }}
         script: |
           cd ${{ secrets.PRODUCTION_WP_PATH }}
-          
-          # Create maintenance file
-          cat > .maintenance << 'EOF'
-<?php
-$upgrading = time();
-EOF
-          
-          echo "Maintenance mode enabled"
+          echo "${{ github.sha }}" > wp-content/pf-build.sha
+          wp theme activate hello-artist --allow-root || true
+          wp plugin activate pf-artist-core --allow-root || true
+          wp core update-db --allow-root || true
 
-    - name: Deploy to production
-      uses: appleboy/scp-action@v0.1.4
+          # Actualizar URLs de WordPress
+          wp option update home "${{ env.PRODUCTION_URL }}" --allow-root || true
+          wp option update siteurl "${{ env.PRODUCTION_URL }}" --allow-root || true
+
+          # Purga cachés de verdad
+          wp transient delete --all --allow-root || true
+          wp rocket clean --allow-root || true
+          wp rocket preload --allow-root || true
+          # Purga CDN opcional (Cloudflare/CloudFront) si configuraste tokens:
+          # wp --allow-root rocketcdn purge || true
+
+    - name: Verify deployed commit
+      uses: appleboy/ssh-action@v1
       with:
         host: ${{ secrets.PRODUCTION_HOST }}
         username: ${{ secrets.PRODUCTION_USER }}
         key: ${{ secrets.PRODUCTION_SSH_KEY }}
-        port: ${{ secrets.PRODUCTION_PORT || 22 }}
-        source: "deploy/*"
-        target: "${{ secrets.PRODUCTION_WP_PATH }}/wp-content/themes/hello-artist/"
-        strip_components: 1
-
-    - name: Post-deployment tasks
-      uses: appleboy/ssh-action@v1.0.0
-      with:
-        host: ${{ secrets.PRODUCTION_HOST }}
-        username: ${{ secrets.PRODUCTION_USER }}
-        key: ${{ secrets.PRODUCTION_SSH_KEY }}
-        port: ${{ secrets.PRODUCTION_PORT || 22 }}
+        port: ${{ secrets.PRODUCTION_PORT }}
         script: |
           cd ${{ secrets.PRODUCTION_WP_PATH }}
-          
-          # WP-CLI commands
-          if command -v wp &> /dev/null; then
-            # Update database if needed
-            wp core update-db
-            
-            # Flush rewrite rules
-            wp rewrite flush --hard
-            
-            # Clear all transients
-            wp transient delete --all
-            
-            # Ensure theme is activated
-            wp theme activate hello-artist
-            
-            echo "WordPress maintenance tasks completed"
-          fi
-          
-          # Clear all caches
-          if [ -d "wp-content/cache" ]; then
-            rm -rf wp-content/cache/*
-          fi
-          
-          # Redis cache flush
-          if command -v redis-cli &> /dev/null; then
-            redis-cli flushall
-          fi
-          
-          # WP Rocket cache clear (if available)
-          if command -v wp &> /dev/null && wp plugin is-active wp-rocket; then
-            wp rocket clean --confirm
-          fi
-          
-          # Set production permissions
-          find wp-content/themes/hello-artist -type f -exec chmod 644 {} \;
-          find wp-content/themes/hello-artist -type d -exec chmod 755 {} \;
-          
-          # Remove maintenance mode
-          rm -f .maintenance
-          echo "Maintenance mode disabled"
-
-    - name: Invalidate CDN
-      uses: appleboy/ssh-action@v1.0.0
-      with:
-        host: ${{ secrets.PRODUCTION_HOST }}
-        username: ${{ secrets.PRODUCTION_USER }}
-        key: ${{ secrets.PRODUCTION_SSH_KEY }}
-        port: ${{ secrets.PRODUCTION_PORT || 22 }}
-        script: |
-          # CloudFlare cache purge (if configured)
-          if [ ! -z "${{ secrets.CLOUDFLARE_ZONE_ID }}" ]; then
-            curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
-              -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
-              -H "Content-Type: application/json" \
-              --data '{"purge_everything":true}'
-          fi
-          
-          # AWS CloudFront invalidation (if configured)
-          if [ ! -z "${{ secrets.AWS_CLOUDFRONT_DISTRIBUTION_ID }}" ]; then
-            aws cloudfront create-invalidation \
-              --distribution-id "${{ secrets.AWS_CLOUDFRONT_DISTRIBUTION_ID }}" \
-              --paths "/*"
+          DEPLOYED=$(cat wp-content/pf-build.sha || echo "unknown")
+          echo "Deployed SHA: $DEPLOYED"
+          if [ "$DEPLOYED" != "${{ github.sha }}" ]; then
+            echo "Mismatch in deployed SHA"; exit 1
           fi
 
     - name: Health check
@@ -204,7 +117,7 @@ EOF
         sleep 15
         
         # Test production URL
-        if curl -f "${{ secrets.PRODUCTION_URL }}" > /dev/null 2>&1; then
+        if curl -f "${{ env.PRODUCTION_URL }}" > /dev/null 2>&1; then
           echo "✅ Production deployment successful - site is accessible"
         else
           echo "❌ Production deployment failed - site not accessible"
@@ -213,9 +126,9 @@ EOF
         
         # Test critical pages
         critical_pages=(
-          "${{ secrets.PRODUCTION_URL }}/"
-          "${{ secrets.PRODUCTION_URL }}/shop/"
-          "${{ secrets.PRODUCTION_URL }}/contact/"
+          "${{ env.PRODUCTION_URL }}/"
+          "${{ env.PRODUCTION_URL }}/shop/"
+          "${{ env.PRODUCTION_URL }}/contact/"
         )
         
         for url in "${critical_pages[@]}"; do
@@ -245,7 +158,7 @@ EOF
         prerelease: false
 
     - name: Notify deployment
-      if: always()
+      if: ${{ always() && env.SLACK_WEBHOOK_URL != '' }}
       uses: 8398a7/action-slack@v3
       with:
         status: ${{ job.status }}
@@ -254,8 +167,6 @@ EOF
           🎯 Production deployment ${{ job.status }}
           Branch: ${{ github.ref }}
           Commit: ${{ github.sha }}
-          Author: ${{ github.actor }}
-          URL: ${{ secrets.PRODUCTION_URL }}
+          URL: ${{ env.PRODUCTION_URL }}
       env:
         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      if: env.SLACK_WEBHOOK_URL != ''

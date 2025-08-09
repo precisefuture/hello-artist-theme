@@ -27,6 +27,15 @@ jobs:
         extensions: mbstring, xml, ctype, iconv, intl, pdo_mysql, dom, filter, gd, json
         tools: composer:v2
 
+    - name: Cache Composer dependencies
+      uses: actions/cache@v4
+      if: file_exists('composer.json')
+      with:
+        path: vendor
+        key: composer-${{ runner.os }}-${{ hashFiles('**/composer.lock') }}
+        restore-keys: |
+          composer-${{ runner.os }}-
+
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:

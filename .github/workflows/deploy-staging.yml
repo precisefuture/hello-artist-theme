@@ -4,6 +4,10 @@ on:
   push:
     branches: [ development ]
 
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: true
+
 jobs:
   deploy-staging:
     name: Deploy to Staging Environment
@@ -14,123 +18,104 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup PHP
-      uses: shivammathur/setup-php@v2
-      with:
-        php-version: '8.2'
-        extensions: mbstring, xml, ctype, iconv, intl, pdo_mysql, dom, filter, gd, json
+    - name: Load URLs
+      run: |
+        set -a
+        source .github/urls.env
+        echo "STAGING_URL=$STAGING_URL" >> $GITHUB_ENV
+        echo "PRODUCTION_URL=$PRODUCTION_URL" >> $GITHUB_ENV
 
-    - name: Setup Node.js
+    # ---- Build rápido solo de lo nuestro (tema + plugin) ----
+    - name: Setup Node
       uses: actions/setup-node@v4
       with:
-        node-version: '20'
+        node-version: 20
         cache: 'npm'
+        cache-dependency-path: |
+          package-lock.json
+          ../pf-artist-core/package-lock.json
 
-    - name: Install dependencies and build
+    - name: Build theme assets
       run: |
-        if [ -f "composer.json" ]; then
-          composer install --no-dev --optimize-autoloader
-        fi
-        
         if [ -f "package.json" ]; then
           npm ci
           npm run build || npm run prod || echo "No build script available"
         fi
 
-    - name: Prepare deployment package
-      run: |
-        # Create deployment directory
-        mkdir -p deploy
-        
-        # Copy theme files (exclude dev dependencies and configs)
-        rsync -av --exclude='.git' \
-                  --exclude='node_modules' \
-                  --exclude='vendor' \
-                  --exclude='.github' \
-                  --exclude='*.md' \
-                  --exclude='package*.json' \
-                  --exclude='composer.*' \
-                  --exclude='.*' \
-                  ./ deploy/
-        
-        # Create version file
-        echo "${{ github.sha }}" > deploy/VERSION
-        echo "$(date -u)" > deploy/DEPLOYED_AT
+    # (Si tu plugin tiene build, descomenta)
+    # - name: Build plugin assets
+    #   working-directory: ../pf-artist-core
+    #   run: |
+    #     npm ci
+    #     npm run build
 
-    - name: Deploy via SSH
-      uses: appleboy/ssh-action@v1.0.0
+    # ---- Despliegue incremental por SSH/rsync ----
+    - name: Sync theme
+      uses: burnett01/rsync-deployments@6.0
+      with:
+        switches: -az --delete
+        path: ./
+        remote_path: ${{ secrets.STAGING_WP_PATH }}/wp-content/themes/hello-artist/
+        remote_host: ${{ secrets.STAGING_HOST }}
+        remote_user: ${{ secrets.STAGING_USER }}
+        remote_port: ${{ secrets.STAGING_PORT }}
+        remote_key: ${{ secrets.STAGING_SSH_KEY }}
+
+    - name: Sync plugin (pf-artist-core)
+      uses: burnett01/rsync-deployments@6.0
+      with:
+        switches: -az --delete
+        path: ../pf-artist-core/
+        remote_path: ${{ secrets.STAGING_WP_PATH }}/wp-content/plugins/pf-artist-core/
+        remote_host: ${{ secrets.STAGING_HOST }}
+        remote_user: ${{ secrets.STAGING_USER }}
+        remote_port: ${{ secrets.STAGING_PORT }}
+        remote_key: ${{ secrets.STAGING_SSH_KEY }}
+
+    # ---- Post-deploy en servidor: activar tema, DB updates, caches, marca de build ----
+    - name: Post-deploy tasks
+      uses: appleboy/ssh-action@v1
       with:
         host: ${{ secrets.STAGING_HOST }}
         username: ${{ secrets.STAGING_USER }}
         key: ${{ secrets.STAGING_SSH_KEY }}
-        port: ${{ secrets.STAGING_PORT || 22 }}
+        port: ${{ secrets.STAGING_PORT }}
         script: |
-          # Set environment variables
-          export WP_ENV=staging
-          
-          # Navigate to WordPress themes directory
-          cd ${{ secrets.STAGING_WP_PATH }}/wp-content/themes/
-          
-          # Backup current theme
-          if [ -d "hello-artist" ]; then
-            cp -r hello-artist hello-artist-backup-$(date +%Y%m%d-%H%M%S)
-          fi
-          
-          # Create theme directory if it doesn't exist
-          mkdir -p hello-artist
-
-    - name: Upload theme files
-      uses: appleboy/scp-action@v0.1.4
-      with:
-        host: ${{ secrets.STAGING_HOST }}
-        username: ${{ secrets.STAGING_USER }}
-        key: ${{ secrets.STAGING_SSH_KEY }}
-        port: ${{ secrets.STAGING_PORT || 22 }}
-        source: "deploy/*"
-        target: "${{ secrets.STAGING_WP_PATH }}/wp-content/themes/hello-artist/"
-        strip_components: 1
-
-    - name: Post-deployment tasks
-      uses: appleboy/ssh-action@v1.0.0
-      with:
-        host: ${{ secrets.STAGING_HOST }}
-        username: ${{ secrets.STAGING_USER }}
-        key: ${{ secrets.STAGING_SSH_KEY }}
-        port: ${{ secrets.STAGING_PORT || 22 }}
-        script: |
-          # Navigate to WordPress root
           cd ${{ secrets.STAGING_WP_PATH }}
-          
-          # WP-CLI commands
-          if command -v wp &> /dev/null; then
-            # Flush rewrite rules
-            wp rewrite flush --hard
-            
-            # Clear transients
-            wp transient delete --all
-            
-            # Update database if needed
-            wp core update-db
-            
-            # Activate theme
-            wp theme activate hello-artist
-            
-            echo "Theme activated successfully"
+          # Marca del commit desplegado
+          echo "${{ github.sha }}" > wp-content/pf-build.sha
+
+          # Activar tema (por si acaso) y correr posibles migrations
+          wp theme activate hello-artist --allow-root || true
+          wp plugin activate pf-artist-core --allow-root || true
+          wp core update-db --allow-root || true
+
+          # Actualizar URLs de WordPress
+          wp option update home "${{ env.STAGING_URL }}" --allow-root || true
+          wp option update siteurl "${{ env.STAGING_URL }}" --allow-root || true
+
+          # Purga cachés
+          wp transient delete --all --allow-root || true
+          wp rocket clean --allow-root || true
+          wp rocket preload --allow-root || true
+          # Opcional: purga Redis si usas object cache
+          # wp redis flush --allow-root || true
+
+    # ---- Verificación remota de commit ----
+    - name: Verify deployed commit
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.STAGING_HOST }}
+        username: ${{ secrets.STAGING_USER }}
+        key: ${{ secrets.STAGING_SSH_KEY }}
+        port: ${{ secrets.STAGING_PORT }}
+        script: |
+          cd ${{ secrets.STAGING_WP_PATH }}
+          DEPLOYED=$(cat wp-content/pf-build.sha || echo "unknown")
+          echo "Deployed SHA: $DEPLOYED"
+          if [ "$DEPLOYED" != "${{ github.sha }}" ]; then
+            echo "Mismatch in deployed SHA"; exit 1
           fi
-          
-          # Clear caches
-          if [ -d "wp-content/cache" ]; then
-            rm -rf wp-content/cache/*
-          fi
-          
-          # Redis cache flush (if available)
-          if command -v redis-cli &> /dev/null; then
-            redis-cli flushall
-          fi
-          
-          # Set proper permissions
-          find wp-content/themes/hello-artist -type f -exec chmod 644 {} \;
-          find wp-content/themes/hello-artist -type d -exec chmod 755 {} \;
 
     - name: Health check
       run: |
@@ -138,15 +123,16 @@ jobs:
         sleep 10
         
         # Test staging URL
-        if curl -f "${{ secrets.STAGING_URL }}" > /dev/null 2>&1; then
+        if curl -f "${{ env.STAGING_URL }}" > /dev/null 2>&1; then
           echo "✅ Staging deployment successful - site is accessible"
         else
           echo "❌ Staging deployment may have issues - site not accessible"
           exit 1
         fi
 
+    # ---- Notificación Slack (si configuraste el secret) ----
     - name: Notify deployment
-      if: always()
+      if: ${{ always() && env.SLACK_WEBHOOK_URL != '' }}
       uses: 8398a7/action-slack@v3
       with:
         status: ${{ job.status }}
@@ -155,8 +141,6 @@ jobs:
           🚀 Staging deployment ${{ job.status }}
           Branch: ${{ github.ref }}
           Commit: ${{ github.sha }}
-          Author: ${{ github.actor }}
-          URL: ${{ secrets.STAGING_URL }}
+          URL: ${{ env.STAGING_URL }}
       env:
         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      if: env.SLACK_WEBHOOK_URL != ''
