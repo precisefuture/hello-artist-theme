@@ -1,0 +1,162 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [ development ]
+
+jobs:
+  deploy-staging:
+    name: Deploy to Staging Environment
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.2'
+        extensions: mbstring, xml, ctype, iconv, intl, pdo_mysql, dom, filter, gd, json
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install dependencies and build
+      run: |
+        if [ -f "composer.json" ]; then
+          composer install --no-dev --optimize-autoloader
+        fi
+        
+        if [ -f "package.json" ]; then
+          npm ci
+          npm run build || npm run prod || echo "No build script available"
+        fi
+
+    - name: Prepare deployment package
+      run: |
+        # Create deployment directory
+        mkdir -p deploy
+        
+        # Copy theme files (exclude dev dependencies and configs)
+        rsync -av --exclude='.git' \
+                  --exclude='node_modules' \
+                  --exclude='vendor' \
+                  --exclude='.github' \
+                  --exclude='*.md' \
+                  --exclude='package*.json' \
+                  --exclude='composer.*' \
+                  --exclude='.*' \
+                  ./ deploy/
+        
+        # Create version file
+        echo "${{ github.sha }}" > deploy/VERSION
+        echo "$(date -u)" > deploy/DEPLOYED_AT
+
+    - name: Deploy via SSH
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.STAGING_HOST }}
+        username: ${{ secrets.STAGING_USER }}
+        key: ${{ secrets.STAGING_SSH_KEY }}
+        port: ${{ secrets.STAGING_PORT || 22 }}
+        script: |
+          # Set environment variables
+          export WP_ENV=staging
+          
+          # Navigate to WordPress themes directory
+          cd ${{ secrets.STAGING_WP_PATH }}/wp-content/themes/
+          
+          # Backup current theme
+          if [ -d "hello-artist" ]; then
+            cp -r hello-artist hello-artist-backup-$(date +%Y%m%d-%H%M%S)
+          fi
+          
+          # Create theme directory if it doesn't exist
+          mkdir -p hello-artist
+
+    - name: Upload theme files
+      uses: appleboy/scp-action@v0.1.4
+      with:
+        host: ${{ secrets.STAGING_HOST }}
+        username: ${{ secrets.STAGING_USER }}
+        key: ${{ secrets.STAGING_SSH_KEY }}
+        port: ${{ secrets.STAGING_PORT || 22 }}
+        source: "deploy/*"
+        target: "${{ secrets.STAGING_WP_PATH }}/wp-content/themes/hello-artist/"
+        strip_components: 1
+
+    - name: Post-deployment tasks
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.STAGING_HOST }}
+        username: ${{ secrets.STAGING_USER }}
+        key: ${{ secrets.STAGING_SSH_KEY }}
+        port: ${{ secrets.STAGING_PORT || 22 }}
+        script: |
+          # Navigate to WordPress root
+          cd ${{ secrets.STAGING_WP_PATH }}
+          
+          # WP-CLI commands
+          if command -v wp &> /dev/null; then
+            # Flush rewrite rules
+            wp rewrite flush --hard
+            
+            # Clear transients
+            wp transient delete --all
+            
+            # Update database if needed
+            wp core update-db
+            
+            # Activate theme
+            wp theme activate hello-artist
+            
+            echo "Theme activated successfully"
+          fi
+          
+          # Clear caches
+          if [ -d "wp-content/cache" ]; then
+            rm -rf wp-content/cache/*
+          fi
+          
+          # Redis cache flush (if available)
+          if command -v redis-cli &> /dev/null; then
+            redis-cli flushall
+          fi
+          
+          # Set proper permissions
+          find wp-content/themes/hello-artist -type f -exec chmod 644 {} \;
+          find wp-content/themes/hello-artist -type d -exec chmod 755 {} \;
+
+    - name: Health check
+      run: |
+        echo "Waiting for deployment to settle..."
+        sleep 10
+        
+        # Test staging URL
+        if curl -f "${{ secrets.STAGING_URL }}" > /dev/null 2>&1; then
+          echo "✅ Staging deployment successful - site is accessible"
+        else
+          echo "❌ Staging deployment may have issues - site not accessible"
+          exit 1
+        fi
+
+    - name: Notify deployment
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        text: |
+          🚀 Staging deployment ${{ job.status }}
+          Branch: ${{ github.ref }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+          URL: ${{ secrets.STAGING_URL }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      if: env.SLACK_WEBHOOK_URL != ''

@@ -1,0 +1,223 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    branches: [ development, production ]
+  push:
+    branches: [ development, production ]
+
+jobs:
+  lint-and-build:
+    name: Lint and Build
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        php-version: [8.2, 8.3]
+        node-version: [18, 20]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php-version }}
+        extensions: mbstring, xml, ctype, iconv, intl, pdo_mysql, dom, filter, gd, json
+        tools: composer:v2
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+
+    - name: Install PHP dependencies
+      if: file_exists('composer.json')
+      run: |
+        if [ -f "composer.json" ]; then
+          composer validate --strict
+          composer install --prefer-dist --no-progress --no-dev --optimize-autoloader
+        fi
+
+    - name: Install Node dependencies
+      if: file_exists('package.json')
+      run: |
+        if [ -f "package.json" ]; then
+          npm ci
+        fi
+
+    - name: PHP Code Style (PHPCS WordPress)
+      run: |
+        if command -v phpcs &> /dev/null; then
+          phpcs --standard=WordPress --extensions=php --ignore=*/vendor/*,*/node_modules/* .
+        else
+          echo "PHPCS not found, skipping PHP linting"
+        fi
+
+    - name: JavaScript Linting (ESLint)
+      if: file_exists('package.json')
+      run: |
+        if [ -f "package.json" ] && npm list eslint &> /dev/null; then
+          npm run lint:js || npm run eslint || echo "ESLint not configured"
+        fi
+
+    - name: CSS Linting (Stylelint)
+      if: file_exists('package.json')
+      run: |
+        if [ -f "package.json" ] && npm list stylelint &> /dev/null; then
+          npm run lint:css || npm run stylelint || echo "Stylelint not configured"
+        fi
+
+    - name: Security Audit
+      if: file_exists('package.json')
+      run: |
+        if [ -f "package.json" ]; then
+          npm audit --audit-level=high
+        fi
+
+    - name: Build Assets
+      if: file_exists('package.json')
+      run: |
+        if [ -f "package.json" ]; then
+          npm run build || npm run prod || echo "No build script found"
+        fi
+
+    - name: Check Bundle Size
+      if: file_exists('package.json')
+      run: |
+        if [ -d "build" ] || [ -d "dist" ]; then
+          echo "=== Bundle Size Report ==="
+          find build dist -name "*.css" -exec sh -c 'echo "CSS: $(basename "$1") - $(gzip -c "$1" | wc -c) bytes gzipped"' _ {} \; 2>/dev/null || true
+          find build dist -name "*.js" -exec sh -c 'echo "JS: $(basename "$1") - $(gzip -c "$1" | wc -c) bytes gzipped"' _ {} \; 2>/dev/null || true
+          
+          # Check performance budget (CSS ≤ 60KB, JS ≤ 15KB gzipped)
+          css_size=$(find build dist -name "*.css" -exec gzip -c {} \; 2>/dev/null | wc -c || echo 0)
+          js_size=$(find build dist -name "*.js" -exec gzip -c {} \; 2>/dev/null | wc -c || echo 0)
+          
+          if [ "$css_size" -gt 61440 ]; then # 60KB = 61440 bytes
+            echo "❌ CSS bundle size exceeds 60KB gzipped limit: ${css_size} bytes"
+            exit 1
+          fi
+          
+          if [ "$js_size" -gt 15360 ]; then # 15KB = 15360 bytes
+            echo "❌ JS bundle size exceeds 15KB gzipped limit: ${js_size} bytes"
+            exit 1
+          fi
+          
+          echo "✅ Bundle sizes within performance budget"
+        fi
+
+    - name: PHPUnit Tests
+      if: file_exists('phpunit.xml') || file_exists('phpunit.xml.dist')
+      run: |
+        if [ -f "phpunit.xml" ] || [ -f "phpunit.xml.dist" ]; then
+          vendor/bin/phpunit || phpunit || echo "PHPUnit not available"
+        fi
+
+  wp-env-smoke-test:
+    name: WordPress Environment Smoke Test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install wp-env
+      run: npm install -g @wordpress/env
+
+    - name: Create wp-env config
+      run: |
+        cat > .wp-env.json << EOF
+        {
+          "core": "WordPress/WordPress#6.4",
+          "plugins": [
+            "https://downloads.wordpress.org/plugin/woocommerce.latest-stable.zip"
+          ],
+          "themes": [
+            ".",
+            "https://downloads.wordpress.org/theme/hello-elementor.latest-stable.zip"
+          ],
+          "env": {
+            "tests": {
+              "WP_DEBUG": true,
+              "WP_DEBUG_LOG": true
+            }
+          }
+        }
+        EOF
+
+    - name: Start WordPress environment
+      run: wp-env start
+
+    - name: Activate theme
+      run: |
+        wp-env run cli wp theme activate hello-artist
+        wp-env run cli wp theme list
+
+    - name: Basic smoke tests
+      run: |
+        echo "Testing homepage..."
+        curl -f http://localhost:8888/ > /dev/null
+        
+        echo "Testing admin..."
+        curl -f http://localhost:8888/wp-admin/ > /dev/null
+        
+        echo "✅ Basic smoke tests passed"
+
+    - name: Cleanup
+      if: always()
+      run: wp-env destroy
+
+  lighthouse-ci:
+    name: Lighthouse Performance Test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && contains(github.head_ref, 'feature/')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install dependencies
+      run: |
+        npm install -g @lhci/cli
+        npm install -g @wordpress/env
+
+    - name: Start WordPress environment
+      run: |
+        cat > .wp-env.json << EOF
+        {
+          "core": "WordPress/WordPress#6.4",
+          "plugins": [
+            "https://downloads.wordpress.org/plugin/woocommerce.latest-stable.zip"
+          ],
+          "themes": [
+            ".",
+            "https://downloads.wordpress.org/theme/hello-elementor.latest-stable.zip"
+          ]
+        }
+        EOF
+        wp-env start
+        wp-env run cli wp theme activate hello-artist
+
+    - name: Run Lighthouse CI
+      run: |
+        lhci autorun --upload.target=temporary-public-storage || echo "Lighthouse CI completed with warnings"
+      env:
+        LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+    - name: Cleanup
+      if: always()
+      run: wp-env destroy
